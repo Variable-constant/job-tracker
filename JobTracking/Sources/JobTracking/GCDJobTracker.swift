@@ -12,7 +12,7 @@ public class GCDJobTracker<Key: Hashable, Output, Failure: Error>: CallbackJobTr
     private let worker: JobWorker<Key, Output, Failure>
     private let execQueue: DispatchQueue
     private let syncQueue: DispatchQueue
-    private var cache: [Key: StoredData<Output, Failure>] = [:]
+    private var states: [Key: JobState<Output, Failure>] = [:]
     
     required public init(memoizing: MemoizationOptions, worker: @escaping JobWorker<Key, Output, Failure>) {
         self.memoizing = memoizing
@@ -22,60 +22,61 @@ public class GCDJobTracker<Key: Hashable, Output, Failure: Error>: CallbackJobTr
     }
     
     public func startJob(for key: Key, completion: @escaping (Result<Output, Failure>) -> Void) {
-        syncQueue.sync {
-            guard memoizing.contains(.started) else {
-                execQueue.async {
-                    self.worker(key) { completion($0) }
-                }
-                return
+        guard self.memoizing.contains(.started) else {
+            self.execQueue.async {
+                self.worker(key) { completion($0) }
+            }
+            return
+        }
+        
+        syncQueue.async {
+            if self.states[key] == nil {
+                self.states[key] = JobState.neverStarted
             }
             
-            if cache[key] == nil {
-                cache[key] = StoredData()
-            }
-            
-            guard cache[key]!.isRunning else {
-                cache[key]?.isRunning = true
-                cache[key]?.notifier.enter()
-                execQueue.async {
-                    if self.cache[key]?.failed != nil && self.memoizing.contains(.failed) {
-                        self.cache[key]?.running = self.cache[key]?.failed
-                    } else if self.cache[key]?.succeeded != nil && self.memoizing.contains(.succeeded) {
-                        self.cache[key]?.running = self.cache[key]?.failed
-                    } else {
-                        self.worker(key) { res in
-                            switch res {
-                            case .success(_):
-                                if self.memoizing.contains(.succeeded) {
-                                    self.cache[key]?.succeeded = res
-                                }
-                            case .failure(_):
-                                if self.memoizing.contains(.failed) {
-                                    self.cache[key]?.failed = res
-                                }
-                            }
-                            self.cache[key]?.running = res
+            self.syncQueue.async {
+                switch self.states[key]! {
+                case JobState<Output, Failure>.neverStarted:
+                    break
+                case var JobState.running(awaitingCallbacks: queue):
+                    queue.append(completion)
+                    return
+                case let JobState.completed(result: res):
+                    switch res {
+                    case .failure(_):
+                        if self.memoizing.contains(.failed) {
+                            completion(res)
+                            return
+                        }
+                    case .success(_):
+                        if self.memoizing.contains(.succeeded) {
+                            completion(res)
+                            return
                         }
                     }
-                    self.cache[key]?.notifier.leave()
-                    completion(self.cache[key]!.running!)
-                    self.cache[key]?.isRunning = false
                 }
-                return
-            }
-            
-            execQueue.async {
-                self.cache[key]?.notifier.wait()
-                completion(self.cache[key]!.running!)
+                self.states[key] = JobState.running(awaitingCallbacks: [completion])
+                self.execQueue.async {
+                    self.worker(key) { res in
+                        self.syncQueue.async {
+                            if case let JobState.running(awaitingCallbacks: completions) = self.states[key]! {
+                                self.states[key] = JobState.completed(result: res)
+                                self.execQueue.async {
+                                    for c in completions {
+                                        c(res)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-struct StoredData<Output, Failure: Error> {
-    var failed: Result<Output, Failure>?
-    var succeeded: Result<Output, Failure>?
-    var running: Result<Output, Failure>?
-    var isRunning: Bool = false
-    let notifier: DispatchGroup = DispatchGroup()
+enum JobState<Output, Failure: Error> {
+    case neverStarted
+    case running(awaitingCallbacks: [(Result<Output, Failure>) -> Void])
+    case completed(result: Result<Output, Failure>)
 }
