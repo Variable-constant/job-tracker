@@ -29,11 +29,14 @@ public class GCDJobTracker<Key: Hashable, Output, Failure: Error>: CallbackJobTr
             return
         }
         
+        // sync block for nil value check
+        // if don't have that block it is possible to assign states[key] multiple times, it won't affect us in the future but it's race condition
         syncQueue.async {
             if self.states[key] == nil {
                 self.states[key] = JobState.neverStarted
             }
             
+            // sync "append to running queue in case of running" with "start of running queue evaluation"
             self.syncQueue.async {
                 switch self.states[key]! {
                 case JobState<Output, Failure>.neverStarted:
@@ -58,7 +61,9 @@ public class GCDJobTracker<Key: Hashable, Output, Failure: Error>: CallbackJobTr
                 self.states[key] = JobState.running(awaitingCallbacks: [completion])
                 self.execQueue.async {
                     self.worker(key) { res in
+                        // that is "start of running queue evaluation" part of sync
                         self.syncQueue.async {
+                            // if we are in this block then self.states[key] is at .running state
                             if case let JobState.running(awaitingCallbacks: completions) = self.states[key]! {
                                 self.states[key] = JobState.completed(result: res)
                                 self.execQueue.async {
